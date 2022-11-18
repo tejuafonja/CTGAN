@@ -7,11 +7,27 @@ import pandas as pd
 import torch
 from packaging import version
 from torch import optim
-from torch.nn import BatchNorm1d, Dropout, LeakyReLU, Linear, Module, ReLU, Sequential, functional
+from torch.nn import (
+    BatchNorm1d,
+    Dropout,
+    LeakyReLU,
+    Linear,
+    Module,
+    ReLU,
+    Sequential,
+    functional,
+)
 
 from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
+
+from sdmetrics.single_table.efficacy.binary import BinaryLogisticRegression
+from ctgan.experiments.logger import Logger, savefig
+from ctgan.experiments.utils import column_metric_wrapper, histogram_intersection
+from functools import partial
+import copy
+# import pdb
 
 
 class Discriminator(Module):
@@ -30,7 +46,9 @@ class Discriminator(Module):
         seq += [Linear(dim, 1)]
         self.seq = Sequential(*seq)
 
-    def calc_gradient_penalty(self, real_data, fake_data, device='cpu', pac=10, lambda_=10):
+    def calc_gradient_penalty(
+        self, real_data, fake_data, device="cpu", pac=10, lambda_=10
+    ):
         """Compute the gradient penalty."""
         alpha = torch.rand(real_data.size(0) // pac, 1, 1, device=device)
         alpha = alpha.repeat(1, pac, real_data.size(1))
@@ -41,9 +59,12 @@ class Discriminator(Module):
         disc_interpolates = self(interpolates)
 
         gradients = torch.autograd.grad(
-            outputs=disc_interpolates, inputs=interpolates,
+            outputs=disc_interpolates,
+            inputs=interpolates,
             grad_outputs=torch.ones(disc_interpolates.size(), device=device),
-            create_graph=True, retain_graph=True, only_inputs=True
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
         )[0]
 
         gradients_view = gradients.view(-1, pac * real_data.size(1)).norm(2, dim=1) - 1
@@ -93,6 +114,14 @@ class Generator(Module):
         return data
 
 
+class Identity(Module):
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, x):
+        return x
+
+
 class CTGAN(BaseSynthesizer):
     """Conditional Table GAN Synthesizer.
 
@@ -138,12 +167,30 @@ class CTGAN(BaseSynthesizer):
             Whether to attempt to use cuda for GPU computation.
             If this is False or CUDA is not available, CPU will be used.
             Defaults to ``True``.
+        log_dir (str):
+            Directory to save logs
     """
 
-    def __init__(self, embedding_dim=128, generator_dim=(256, 256), discriminator_dim=(256, 256),
-                 generator_lr=2e-4, generator_decay=1e-6, discriminator_lr=2e-4,
-                 discriminator_decay=1e-6, batch_size=500, discriminator_steps=1,
-                 log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True):
+    def __init__(
+        self,
+        embedding_dim=128,
+        generator_dim=(256, 256),
+        discriminator_dim=(256, 256),
+        generator_lr=2e-4,
+        generator_decay=1e-6,
+        discriminator_lr=2e-4,
+        discriminator_decay=1e-6,
+        batch_size=500,
+        discriminator_steps=1,
+        log_frequency=True,
+        verbose=False,
+        epochs=300,
+        pac=10,
+        cuda=True,
+        log_dict=None,
+        evaluation_dict=None,
+        generator_penalty_dict=None,
+    ):
 
         assert batch_size % 2 == 0
 
@@ -163,12 +210,16 @@ class CTGAN(BaseSynthesizer):
         self._epochs = epochs
         self.pac = pac
 
+        self._log_dict = log_dict
+        self._evaluation_dict = evaluation_dict
+        self._generator_penalty_dict = generator_penalty_dict
+
         if not cuda or not torch.cuda.is_available():
-            device = 'cpu'
+            device = "cpu"
         elif isinstance(cuda, str):
             device = cuda
         else:
-            device = 'cuda'
+            device = "cuda"
 
         self._device = torch.device(device)
 
@@ -197,13 +248,14 @@ class CTGAN(BaseSynthesizer):
         Returns:
             Sampled tensor of same shape as logits from the Gumbel-Softmax distribution.
         """
-        if version.parse(torch.__version__) < version.parse('1.2.0'):
+        if version.parse(torch.__version__) < version.parse("1.2.0"):
             for i in range(10):
-                transformed = functional.gumbel_softmax(logits, tau=tau, hard=hard,
-                                                        eps=eps, dim=dim)
+                transformed = functional.gumbel_softmax(
+                    logits, tau=tau, hard=hard, eps=eps, dim=dim
+                )
                 if not torch.isnan(transformed).any():
                     return transformed
-            raise ValueError('gumbel_softmax returning NaN.')
+            raise ValueError("gumbel_softmax returning NaN.")
 
         return functional.gumbel_softmax(logits, tau=tau, hard=hard, eps=eps, dim=dim)
 
@@ -213,17 +265,19 @@ class CTGAN(BaseSynthesizer):
         st = 0
         for column_info in self._transformer.output_info_list:
             for span_info in column_info:
-                if span_info.activation_fn == 'tanh':
+                if span_info.activation_fn == "tanh":
                     ed = st + span_info.dim
                     data_t.append(torch.tanh(data[:, st:ed]))
                     st = ed
-                elif span_info.activation_fn == 'softmax':
+                elif span_info.activation_fn == "softmax":
                     ed = st + span_info.dim
                     transformed = self._gumbel_softmax(data[:, st:ed], tau=0.2)
                     data_t.append(transformed)
                     st = ed
                 else:
-                    raise ValueError(f'Unexpected activation function {span_info.activation_fn}.')
+                    raise ValueError(
+                        f"Unexpected activation function {span_info.activation_fn}."
+                    )
 
         return torch.cat(data_t, dim=1)
 
@@ -234,7 +288,7 @@ class CTGAN(BaseSynthesizer):
         st_c = 0
         for column_info in self._transformer.output_info_list:
             for span_info in column_info:
-                if len(column_info) != 1 or span_info.activation_fn != 'softmax':
+                if len(column_info) != 1 or span_info.activation_fn != "softmax":
                     # not discrete column
                     st += span_info.dim
                 else:
@@ -243,7 +297,7 @@ class CTGAN(BaseSynthesizer):
                     tmp = functional.cross_entropy(
                         data[:, st:ed],
                         torch.argmax(c[:, st_c:ed_c], dim=1),
-                        reduction='none'
+                        reduction="none",
                     )
                     loss.append(tmp)
                     st = ed
@@ -252,6 +306,51 @@ class CTGAN(BaseSynthesizer):
         loss = torch.stack(loss, dim=1)  # noqa: PD013
 
         return (loss * m).sum() / data.size()[0]
+
+    def _info_loss_sdgym(self, data_real, data_fake, norm=1):
+        """Tablegan stdgym info loss implementation.
+
+        Args:
+            data_real (torch.Tensor):
+                Real data (b, m)
+            data_fake (torch.Tensor):
+                Fake data with activation applied (b, m).
+            norm (int, optional):
+                The order of norm. Defaults to 1.
+
+        Returns:
+            loss_info:
+                summation of the norm of expected mean and
+                standard deviation difference between the real
+                and fake data.
+        """
+        loss_mean = torch.norm(
+            torch.mean(data_fake, dim=0) - torch.mean(data_real, dim=0), p=norm
+        )
+        loss_std = torch.norm(
+            torch.std(data_fake, dim=0) - torch.std(data_real, dim=0), p=norm
+        )
+        loss_info = loss_mean + loss_std
+
+        return loss_info
+
+    def _info_loss_tablegan(self, model_disc, data_real, data_fake):
+        model_disc_copy = copy.deepcopy(model_disc)
+        model_disc_copy.seq = Sequential(*list(model_disc.seq.children())[:-1])
+        real_features = model_disc_copy(data_real).flatten()
+        fake_features = model_disc_copy(data_fake).flatten()
+
+        mean_real_features = real_features.mean()
+        mean_fake_features = fake_features.mean()
+
+        std_real_features = real_features.std()
+        std_fake_features = fake_features.std()
+
+        loss_mean = torch.norm(mean_real_features - mean_fake_features, p=2)
+        loss_std = torch.norm(std_real_features - std_fake_features, p=2)
+
+        loss_info = loss_mean + loss_std
+        return loss_info
 
     def _validate_discrete_columns(self, train_data, discrete_columns):
         """Check whether ``discrete_columns`` exists in ``train_data``.
@@ -273,10 +372,10 @@ class CTGAN(BaseSynthesizer):
                 if column < 0 or column >= train_data.shape[1]:
                     invalid_columns.append(column)
         else:
-            raise TypeError('``train_data`` should be either pd.DataFrame or np.array.')
+            raise TypeError("``train_data`` should be either pd.DataFrame or np.array.")
 
         if invalid_columns:
-            raise ValueError(f'Invalid columns found: {invalid_columns}')
+            raise ValueError(f"Invalid columns found: {invalid_columns}")
 
     @random_state
     def fit(self, train_data, discrete_columns=(), epochs=None):
@@ -297,10 +396,21 @@ class CTGAN(BaseSynthesizer):
             epochs = self._epochs
         else:
             warnings.warn(
-                ('`epochs` argument in `fit` method has been deprecated and will be removed '
-                 'in a future version. Please pass `epochs` to the constructor instead'),
-                DeprecationWarning
+                (
+                    "`epochs` argument in `fit` method has been deprecated and will be removed "
+                    "in a future version. Please pass `epochs` to the constructor instead"
+                ),
+                DeprecationWarning,
             )
+
+        ### Train data evaluation
+        eval_data = train_data.copy()
+        train_size = eval_data.shape[0]
+        target = self._evaluation_dict["target"]
+        real_f1 = BinaryLogisticRegression.compute(
+            test_data=eval_data, train_data=eval_data, target=target
+        )
+        ###
 
         self._transformer = DataTransformer()
         self._transformer.fit(train_data, discrete_columns)
@@ -308,39 +418,67 @@ class CTGAN(BaseSynthesizer):
         train_data = self._transformer.transform(train_data)
 
         self._data_sampler = DataSampler(
-            train_data,
-            self._transformer.output_info_list,
-            self._log_frequency)
+            train_data, self._transformer.output_info_list, self._log_frequency
+        )
 
         data_dim = self._transformer.output_dimensions
 
         self._generator = Generator(
             self._embedding_dim + self._data_sampler.dim_cond_vec(),
             self._generator_dim,
-            data_dim
+            data_dim,
         ).to(self._device)
 
         discriminator = Discriminator(
             data_dim + self._data_sampler.dim_cond_vec(),
             self._discriminator_dim,
-            pac=self.pac
+            pac=self.pac,
         ).to(self._device)
 
         optimizerG = optim.Adam(
-            self._generator.parameters(), lr=self._generator_lr, betas=(0.5, 0.9),
-            weight_decay=self._generator_decay
+            self._generator.parameters(),
+            lr=self._generator_lr,
+            betas=(0.5, 0.9),
+            weight_decay=self._generator_decay,
         )
 
         optimizerD = optim.Adam(
-            discriminator.parameters(), lr=self._discriminator_lr,
-            betas=(0.5, 0.9), weight_decay=self._discriminator_decay
+            discriminator.parameters(),
+            lr=self._discriminator_lr,
+            betas=(0.5, 0.9),
+            weight_decay=self._discriminator_decay,
         )
 
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
         std = mean + 1
 
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
+
+        ### Setup Logger
+        title = self._log_dict["title"]
+        log_dir = self._log_dict["log_dir"]
+        plot_title = self._log_dict["plot_title"]
+        logger = Logger(f"{log_dir}/log.txt", title=title)
+        logger.set_names(
+            [
+                "Epoch",
+                "Loss/gen",
+                "Loss/disc",
+                "Loss/gen/cond",
+                "Loss/gen/pen",
+                "F1/fake",
+                "F1/real",
+                "Hist/fake/5",
+                "Hist/fake/20",
+                "Hist/fake/50",
+            ]
+        )
+        ###
+
         for i in range(epochs):
+            ### Create empty list
+            log = []
+            ###
             for id_ in range(steps_per_epoch):
 
                 for n in range(self._discriminator_steps):
@@ -349,7 +487,9 @@ class CTGAN(BaseSynthesizer):
                     condvec = self._data_sampler.sample_condvec(self._batch_size)
                     if condvec is None:
                         c1, m1, col, opt = None, None, None, None
-                        real = self._data_sampler.sample_data(self._batch_size, col, opt)
+                        real = self._data_sampler.sample_data(
+                            self._batch_size, col, opt
+                        )
                     else:
                         c1, m1, col, opt = condvec
                         c1 = torch.from_numpy(c1).to(self._device)
@@ -359,13 +499,14 @@ class CTGAN(BaseSynthesizer):
                         perm = np.arange(self._batch_size)
                         np.random.shuffle(perm)
                         real = self._data_sampler.sample_data(
-                            self._batch_size, col[perm], opt[perm])
+                            self._batch_size, col[perm], opt[perm]
+                        )
                         c2 = c1[perm]
 
                     fake = self._generator(fakez)
                     fakeact = self._apply_activate(fake)
 
-                    real = torch.from_numpy(real.astype('float32')).to(self._device)
+                    real = torch.from_numpy(real.astype("float32")).to(self._device)
 
                     if c1 is not None:
                         fake_cat = torch.cat([fakeact, c1], dim=1)
@@ -378,7 +519,8 @@ class CTGAN(BaseSynthesizer):
                     y_real = discriminator(real_cat)
 
                     pen = discriminator.calc_gradient_penalty(
-                        real_cat, fake_cat, self._device, self.pac)
+                        real_cat, fake_cat, self._device, self.pac
+                    )
                     loss_d = -(torch.mean(y_real) - torch.mean(y_fake))
 
                     optimizerD.zero_grad()
@@ -410,16 +552,116 @@ class CTGAN(BaseSynthesizer):
                 else:
                     cross_entropy = self._cond_loss(fake, c1, m1)
 
-                loss_g = -torch.mean(y_fake) + cross_entropy
+                if self._generator_penalty_dict is not None:
+                    if self._generator_penalty_dict["loss"] == "info_loss_sdgym":
+                        norm_order = self._generator_penalty_dict["norm_order"]
+                        gen_loss_pen = self._info_loss_sdgym(
+                            data_real=real, data_fake=fakeact, norm=norm_order
+                        )
+                    elif self._generator_penalty_dict["loss"] == "info_loss_tablegan":
+                        fake_cat = torch.cat([fakeact, c1], dim=1)
+                        real_cat = torch.cat([real, c2], dim=1)
+                        gen_loss_pen = self._info_loss_tablegan(
+                            model_disc=discriminator,
+                            data_real=real_cat,
+                            data_fake=fake_cat,
+                        )
+                    else:
+                        raise NotImplementedError()
+                else:
+                    gen_loss_pen = 0
 
                 optimizerG.zero_grad()
+                loss_g = -torch.mean(y_fake) + cross_entropy + gen_loss_pen
                 loss_g.backward()
                 optimizerG.step()
 
             if self._verbose:
-                print(f'Epoch {i+1}, Loss G: {loss_g.detach().cpu(): .4f},'  # noqa: T001
-                      f'Loss D: {loss_d.detach().cpu(): .4f}',
-                      flush=True)
+                ### Evaluate fake data
+                fake_data = self.sample(n=train_size)
+                fake_f1 = BinaryLogisticRegression.compute(
+                    test_data=eval_data, train_data=fake_data, target=target
+                )
+
+                fake_hists = []
+                for bins in self._evaluation_dict["bins"]:
+                    func = partial(
+                        column_metric_wrapper,
+                        column_metric=partial(histogram_intersection, bins=bins),
+                        cat_cols=discrete_columns,
+                    )
+                    fake_hist = func(
+                        realdata=eval_data, fakedata=fake_data
+                    ).score.mean()
+                    fake_hists.append(fake_hist)
+
+                print(
+                    f"Epoch {i+1}, Loss G: {loss_g.detach().cpu(): .4f},"  # noqa: T001
+                    f"Loss D: {loss_d.detach().cpu(): .4f}",
+                    f"F1: {fake_f1}",
+                    f"Hist: {fake_hists[0]}",
+                    flush=True,
+                )
+
+                ### Update log and plot result
+                log.extend(
+                    [
+                        i + 1,
+                        loss_g.item(),
+                        loss_d.item(),
+                        cross_entropy.item(),
+                        gen_loss_pen.item(),
+                        fake_f1,
+                        real_f1,
+                    ]
+                )
+                log.extend(fake_hists)
+                logger.append(log)
+                logger.plot(
+                    ["Loss/disc", "Loss/gen"],
+                    x=None,
+                    xlabel="Epoch",
+                    title=plot_title,
+                )
+                savefig(f"{log_dir}/loss.png")
+                logger.plot(
+                    ["Loss/gen/cond"],
+                    x=None,
+                    xlabel="Epoch",
+                    title=plot_title,
+                )
+                savefig(f"{log_dir}/loss_cond.png")
+                logger.plot(
+                    ["Loss/gen/pen"],
+                    x=None,
+                    xlabel="Epoch",
+                    title=plot_title,
+                )
+                savefig(f"{log_dir}/loss_gen_pen.png")
+                logger.plot(
+                    [
+                        "F1/real",
+                        "F1/fake",
+                        "Hist/fake/50",
+                    ],
+                    x=None,
+                    xlabel="Epoch",
+                    title=plot_title,
+                )
+                savefig(f"{log_dir}/metrics.png")
+                logger.plot(
+                    [
+                        "Hist/fake/5",
+                        "Hist/fake/20",
+                        "Hist/fake/50",
+                    ],
+                    x=None,
+                    xlabel="Epoch",
+                    title=plot_title,
+                )
+                savefig(f"{log_dir}/hist.png")
+                self.save(f"{log_dir}/model.pt")
+                ###
 
     @random_state
     def sample(self, n, condition_column=None, condition_value=None):
@@ -442,9 +684,13 @@ class CTGAN(BaseSynthesizer):
         """
         if condition_column is not None and condition_value is not None:
             condition_info = self._transformer.convert_column_name_value_to_id(
-                condition_column, condition_value)
-            global_condition_vec = self._data_sampler.generate_cond_from_condition_column_info(
-                condition_info, self._batch_size)
+                condition_column, condition_value
+            )
+            global_condition_vec = (
+                self._data_sampler.generate_cond_from_condition_column_info(
+                    condition_info, self._batch_size
+                )
+            )
         else:
             global_condition_vec = None
 
