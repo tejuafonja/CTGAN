@@ -27,7 +27,8 @@ from ctgan.experiments.logger import Logger, savefig
 from ctgan.experiments.utils import column_metric_wrapper, histogram_intersection
 from functools import partial
 import copy
-# import pdb
+
+import pdb
 
 
 class Discriminator(Module):
@@ -112,14 +113,6 @@ class Generator(Module):
         """Apply the Generator to the `input_`."""
         data = self.seq(input_)
         return data
-
-
-class Identity(Module):
-    def __init__(self):
-        super(Identity, self).__init__()
-
-    def forward(self, x):
-        return x
 
 
 class CTGAN(BaseSynthesizer):
@@ -320,7 +313,7 @@ class CTGAN(BaseSynthesizer):
 
         Returns:
             loss_info:
-                summation of the norm of expected mean and
+                Summation of the norm of expected mean and
                 standard deviation difference between the real
                 and fake data.
         """
@@ -334,23 +327,135 @@ class CTGAN(BaseSynthesizer):
 
         return loss_info
 
-    def _info_loss_tablegan(self, model_disc, data_real, data_fake):
+    def _info_loss_tablegan(
+        self, moving_average_type, id, model_disc, data_real, data_fake
+    ):
         model_disc_copy = copy.deepcopy(model_disc)
         model_disc_copy.seq = Sequential(*list(model_disc.seq.children())[:-1])
-        real_features = model_disc_copy(data_real).flatten()
-        fake_features = model_disc_copy(data_fake).flatten()
+        real_features = model_disc_copy(data_real)
+        fake_features = model_disc_copy(data_fake)
+        if moving_average_type == "simple":
+            (
+                real_mean_features,
+                fake_mean_features,
+                real_std_features,
+                fake_std_features,
+            ) = self._simple_moving_average(id, real_features, fake_features)
 
-        mean_real_features = real_features.mean()
-        mean_fake_features = fake_features.mean()
-
-        std_real_features = real_features.std()
-        std_fake_features = fake_features.std()
-
-        loss_mean = torch.norm(mean_real_features - mean_fake_features, p=2)
-        loss_std = torch.norm(std_real_features - std_fake_features, p=2)
+        elif moving_average_type == "exponential":
+            (
+                real_mean_features,
+                fake_mean_features,
+                real_std_features,
+                fake_std_features,
+            ) = self._exponential_moving_average(id, real_features, fake_features)
+        else:
+            raise NotImplementedError()
+        
+        loss_mean = torch.norm(real_mean_features - fake_mean_features, p=2)
+        loss_std = torch.norm(real_std_features - fake_std_features, p=2)
 
         loss_info = loss_mean + loss_std
         return loss_info
+
+    def _simple_moving_average(self, id, real_features, fake_features):
+        real_mean_features = real_features.mean(dim=0)
+        fake_mean_features = fake_features.mean(dim=0)
+        real_std_features = real_features.std(dim=0)
+        fake_std_features = fake_features.std(dim=0)
+                
+        if id == 0:
+            self._prev_real_mean_features = real_mean_features.detach().view(1, -1)
+            self._prev_fake_mean_features = fake_mean_features.detach().view(1, -1)
+            self._prev_real_std_features = real_std_features.detach().view(1, -1)
+            self._prev_fake_std_features = fake_std_features.detach().view(1, -1)
+            
+        else:            
+            self._prev_real_mean_features = torch.cat(
+                [self._prev_real_mean_features, real_mean_features.detach().view(1, -1)]
+            )
+            self._prev_fake_mean_features = torch.cat(
+                [self._prev_fake_mean_features, fake_mean_features.detach().view(1, -1)]
+            )
+            self._prev_real_std_features = torch.cat(
+                [self._prev_real_std_features, real_std_features.detach().view(1, -1)]
+            )
+            self._prev_fake_std_features = torch.cat(
+                [self._prev_fake_std_features, real_std_features.detach().view(1, -1)]
+            )
+            
+            real_mean_features = self._prev_real_mean_features.mean(dim=0)
+            fake_mean_features = self._prev_fake_mean_features.mean(dim=0)
+            real_std_features = self._prev_real_std_features.std(dim=0)
+            fake_std_features = self._prev_fake_std_features.std(dim=0)
+            
+            # Enable gradient computation
+            real_mean_features.requires_grad = True
+            fake_mean_features.requires_grad = True
+            real_std_features.requires_grad = True
+            fake_std_features.requires_grad = True            
+
+        return (
+            real_mean_features,
+            fake_mean_features,
+            real_std_features,
+            fake_std_features,
+        )
+
+    def _exponential_moving_average(self, id, real_features, fake_features):
+        real_mean_features = real_features.mean(dim=0)
+        fake_mean_features = fake_features.mean(dim=0)
+        real_std_features = real_features.std(dim=0)
+        fake_std_features = fake_features.std(dim=0)
+
+        smoothing_factor = 2 / (1 + self._steps_per_epoch)
+
+        def _moving_average_update(curr_val, previousEMA, smoothing_factor):
+            current_EMA = (smoothing_factor * curr_val) + (
+                (1 - smoothing_factor) * previousEMA
+            )
+            return current_EMA
+
+        if id == 0:
+            self._prev_real_mean_features = torch.zeros_like(real_mean_features, requires_grad=False)
+            self._prev_fake_mean_features = torch.zeros_like(real_mean_features, requires_grad=False)
+            self._prev_real_std_features = torch.zeros_like(real_mean_features, requires_grad=False)
+            self._prev_fake_std_features = torch.zeros_like(real_mean_features, requires_grad=False)
+
+        real_mean_features = _moving_average_update(
+            curr_val=real_mean_features,
+            previousEMA=self._prev_real_mean_features,
+            smoothing_factor=smoothing_factor,
+        )
+        fake_mean_features = _moving_average_update(
+            curr_val=fake_mean_features,
+            previousEMA=self._prev_fake_mean_features,
+            smoothing_factor=smoothing_factor,
+        )
+        real_std_features = _moving_average_update(
+            curr_val=real_std_features,
+            previousEMA=self._prev_real_std_features,
+            smoothing_factor=smoothing_factor,
+        )
+
+        fake_std_features = _moving_average_update(
+            curr_val=fake_std_features,
+            previousEMA=self._prev_fake_std_features,
+            smoothing_factor=smoothing_factor,
+        )
+        
+        # Detach gradient computation
+        self._prev_real_mean_features = real_mean_features.detach()
+        self._prev_fake_mean_features = fake_mean_features.detach()
+        self._prev_real_std_features = real_std_features.detach()
+        self._prev_fake_std_features = fake_std_features.detach()
+        
+        return (
+            real_mean_features,
+            fake_mean_features,
+            real_std_features,
+            fake_std_features,
+        )
 
     def _validate_discrete_columns(self, train_data, discrete_columns):
         """Check whether ``discrete_columns`` exists in ``train_data``.
@@ -452,7 +557,7 @@ class CTGAN(BaseSynthesizer):
         mean = torch.zeros(self._batch_size, self._embedding_dim, device=self._device)
         std = mean + 1
 
-        steps_per_epoch = max(len(train_data) // self._batch_size, 1)
+        self._steps_per_epoch = max(len(train_data) // self._batch_size, 1)
 
         ### Setup Logger
         title = self._log_dict["title"]
@@ -479,7 +584,7 @@ class CTGAN(BaseSynthesizer):
             ### Create empty list
             log = []
             ###
-            for id_ in range(steps_per_epoch):
+            for id_ in range(self._steps_per_epoch):
 
                 for n in range(self._discriminator_steps):
                     fakez = torch.normal(mean=mean, std=std)
@@ -559,9 +664,14 @@ class CTGAN(BaseSynthesizer):
                             data_real=real, data_fake=fakeact, norm=norm_order
                         )
                     elif self._generator_penalty_dict["loss"] == "info_loss_tablegan":
+                        moving_average_type = self._generator_penalty_dict[
+                            "moving_average_type"
+                        ]
                         fake_cat = torch.cat([fakeact, c1], dim=1)
                         real_cat = torch.cat([real, c2], dim=1)
                         gen_loss_pen = self._info_loss_tablegan(
+                            moving_average_type=moving_average_type,
+                            id=id_,
                             model_disc=discriminator,
                             data_real=real_cat,
                             data_fake=fake_cat,
@@ -569,7 +679,7 @@ class CTGAN(BaseSynthesizer):
                     else:
                         raise NotImplementedError()
                 else:
-                    gen_loss_pen = 0
+                    gen_loss_pen = torch.Tensor([0])
 
                 optimizerG.zero_grad()
                 loss_g = -torch.mean(y_fake) + cross_entropy + gen_loss_pen
