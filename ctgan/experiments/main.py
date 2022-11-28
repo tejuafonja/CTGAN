@@ -10,6 +10,11 @@ import numpy as np
 import os
 import shutil
 
+import os
+
+switch_to = os.environ.get("switch_to")
+print(switch_to)
+
 
 real_data = load_demo()
 
@@ -18,6 +23,7 @@ try:
     max_subset = int(sys.argv[2])
     n_epochs = int(sys.argv[3])
     random_seed = int(sys.argv[4])
+    folder_name = sys.argv[5]
 
 except:
     print("Default variable fallback on line 7")
@@ -25,11 +31,13 @@ except:
     max_subset = 2000
     n_epochs = 1000
     random_seed = 1000
+    folder_name = ""
 
 # Set random seed
 random.seed(random_seed)
 torch.manual_seed(random_seed)
 np.random.seed(random_seed)
+
 
 # Names of the columns that are discrete
 discrete_columns = [
@@ -45,11 +53,7 @@ discrete_columns = [
 ]
 
 
-log_dir = f"experiments/results/info_loss_sdgym/l1/adult_{train_size}"
-os.makedirs(log_dir, exist_ok=True)
-
 train_data = real_data[:train_size]
-
 ep = min((max_subset * n_epochs) // train_size, 5000)
 
 print(
@@ -57,25 +61,48 @@ print(
     f"\n\t n_epochs: {n_epochs}"
 )
 
-generator_penalty_dict = {"loss": "info_loss_sdgym", "norm_order": 1}
 
-evaluation_dict = {"target": "income", "bins": [5, 20, 50]}
-plot_title = (f"Data=Adult_{train_size}, " 
-             f"Loss={generator_penalty_dict['loss']}, "
-             f"norm=l{generator_penalty_dict['norm_order']}")
+verbose = False
+if folder_name.split("/")[-1] == "baseline":
+    generator_penalty_dict = None
+    plot_title = f"Data=Adult_{train_size}, Loss=baseline"
+else:
+    losses = folder_name.split("/")[-1].split("+")
+    generator_penalty_dict = {
+        "loss": losses,
+    }
+    plot_title = f"Data=Adult_{train_size}, Loss={losses}"
 
-log_dict = {"log_dir": log_dir, "title": "ctgan", "plot_title": plot_title}
+print(generator_penalty_dict)
 
-ctgan_model = CTGAN(
-    epochs=ep,
-    verbose=True,
-    cuda="cpu",
-    log_dict=log_dict,
-    generator_penalty_dict=generator_penalty_dict,
-    evaluation_dict=evaluation_dict,
-)
-
-ctgan_model.fit(train_data, discrete_columns)
+log_dir = f"experiments/results/{folder_name}/adult_{train_size}"
+os.makedirs(log_dir, exist_ok=True)
 
 ## Store this script
 shutil.copy(os.path.realpath(__file__), log_dir)
+
+
+evaluation_dict = {"target": "income", "bins": [5, 20, 50]}
+log_dict = {"log_dir": log_dir, "title": "ctgan", "plot_title": plot_title}
+
+if switch_to == "modified":
+    ctgan_model = CTGAN(
+        epochs=ep,
+        verbose=verbose,
+        cuda="cpu",
+        log_dict=log_dict,
+        generator_penalty_dict=generator_penalty_dict,
+        evaluation_dict=evaluation_dict,
+    )
+    ctgan_model.fit(train_data, discrete_columns)
+
+    if not verbose:
+        ctgan_model.save(f"{log_dir}/model.pt")
+else:
+    ctgan_model = CTGAN(
+        epochs=ep,
+        verbose=verbose,
+        cuda="cpu",
+    )
+    ctgan_model.fit(train_data, discrete_columns)
+    ctgan_model.save(f"{log_dir}/model.pt")

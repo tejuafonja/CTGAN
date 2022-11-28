@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler, OneHotEncoder
 
+
 def histogram_intersection(
     realdata,
     fakedata,
@@ -98,6 +99,7 @@ def histogram_intersection(
 
     return result
 
+
 def histogram_binning(data, bins=50, categorial=False):
     """Compute the histogram of `data`.
         This function first calculates a
@@ -138,7 +140,10 @@ def histogram_binning(data, bins=50, categorial=False):
 
     return hist, bin_edges
 
-def column_transformer(real_col, fake_col, column_name=None, kind="minmax", fit_data=None):
+
+def column_transformer(
+    real_col, fake_col, column_name=None, kind="minmax", fit_data=None
+):
     """Column Transformer
     Args:
         real_col (array-like):
@@ -149,7 +154,7 @@ def column_transformer(real_col, fake_col, column_name=None, kind="minmax", fit_
             Kind of transformer. Defaults to "minmax".
             Must be one of (`minmax`, `label`, `onehot`)
         fit_data (array-like, optional):
-            Data to fit the column transformer on. Defaults to `None`. 
+            Data to fit the column transformer on. Defaults to `None`.
             Fits the column transformer on `realdata` for numerical columns
             and `realdata+fakedata` for categorical columns.
     Returns:
@@ -160,13 +165,13 @@ def column_transformer(real_col, fake_col, column_name=None, kind="minmax", fit_
         transformer (array-like):
             Transformer object
     """
-    
+
     if kind == "label":
         transformer = LabelEncoder()
-        
+
         real_col = real_col.astype("str")
         fake_col = fake_col.astype("str")
-        
+
         if fit_data is not None:
             fit_data = fit_data.astype("str")
             transformer.fit(fit_data)
@@ -174,18 +179,18 @@ def column_transformer(real_col, fake_col, column_name=None, kind="minmax", fit_
             # fit encoder on concatenated real and fake data
             real_fake = np.concatenate([real_col, fake_col])
             transformer.fit(real_fake)
-        
+
         # encode real and fake data
         real_col = transformer.transform(real_col)
         fake_col = transformer.transform(fake_col)
-        
+
         if column_name is not None:
             real_col = pd.DataFrame(real_col, columns=[column_name])
             fake_col = pd.DataFrame(fake_col, columns=[column_name])
 
     elif kind == "onehot":
         transformer = OneHotEncoder(sparse=False)
-        
+
         if fit_data is not None:
             transformer.fit(fit_data[:, None])
         else:
@@ -196,7 +201,7 @@ def column_transformer(real_col, fake_col, column_name=None, kind="minmax", fit_
         # encode real and fake data
         real_col = transformer.transform(real_col[:, None])
         fake_col = transformer.transform(fake_col[:, None])
-        
+
         if column_name is not None:
             columns = [f"{column_name}_{i.strip()}" for i in transformer.categories_[0]]
             real_col = pd.DataFrame(real_col, columns=columns)
@@ -204,7 +209,7 @@ def column_transformer(real_col, fake_col, column_name=None, kind="minmax", fit_
 
     elif kind == "minmax":
         transformer = MinMaxScaler()
-        
+
         if fit_data is not None:
             transformer.fit(fit_data[:, None])
         else:
@@ -214,26 +219,26 @@ def column_transformer(real_col, fake_col, column_name=None, kind="minmax", fit_
         # rescale real and fake data
         real_col = transformer.transform(real_col[:, None]).squeeze()
         fake_col = transformer.transform(fake_col[:, None]).squeeze()
-        
+
         if column_name is not None:
             real_col = pd.DataFrame(real_col, columns=[column_name])
             fake_col = pd.DataFrame(fake_col, columns=[column_name])
-            
+
     else:
         transformer = None
         if column_name is not None:
             real_col = pd.DataFrame(real_col, columns=[column_name])
             fake_col = pd.DataFrame(fake_col, columns=[column_name])
-        
+
     return real_col, fake_col, transformer
 
 
 def data_transformer(realdata, fakedata):
     column_type = {}
-    
+
     realdata = realdata.reset_index(drop=True)
     fakedata = fakedata.reset_index(drop=True)
-    
+
     for col in realdata:
         field_type = realdata[col].dropna().infer_objects().dtype.kind
         if field_type == "O":
@@ -241,7 +246,7 @@ def data_transformer(realdata, fakedata):
             if len(n_categories) == 2:
                 field_type = "b"
         column_type[col] = field_type
-     
+
     sorted_real_columns = sorted(realdata.columns.tolist())
     sorted_fake_columns = sorted(fakedata.columns.tolist())
 
@@ -252,40 +257,39 @@ def data_transformer(realdata, fakedata):
 
     real_iter = realdata.iteritems()
     fake_iter = fakedata.iteritems()
-    
+
     def _kind(field_type):
         if field_type == "O":
             return "onehot"
         elif field_type == "b":
             return "label"
-        else: 
+        else:
             return None
-        
+
     results = joblib.Parallel(prefer="threads", n_jobs=-1)(
         joblib.delayed(column_transformer)(
             real_col=real_col,
             fake_col=fake_col,
             column_name=column_name,
             kind=_kind(column_type[column_name]),
-            )
-        for (column_name, real_col), (_, fake_col) in zip(real_iter, fake_iter)
         )
-    
+        for (column_name, real_col), (_, fake_col) in zip(real_iter, fake_iter)
+    )
+
     transformed_realdata = []
     transformed_fakedata = []
     transformers = []
-    
+
     for tupl in results:
         transformed_realdata.append(tupl[0])
         transformed_fakedata.append(tupl[1])
         transformers.append(tupl[2])
-        
-   
+
     transformed_realdata = pd.concat(transformed_realdata, axis=1)
     transformed_fakedata = pd.concat(transformed_fakedata, axis=1)
 
     return transformed_realdata, transformed_fakedata, transformers
-            
+
 
 def column_metric_wrapper(
     realdata, fakedata, column_metric, cat_cols=None, random_state=1000
