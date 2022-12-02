@@ -36,6 +36,7 @@ if switch_to == "modified":
     from ctgan.experiments.utils import data_transformer as customized_data_transformer
 
     import pdb
+    from sklearn.decomposition import PCA
 
     class Discriminator(Module):
         """Discriminator for the CTGAN."""
@@ -185,6 +186,7 @@ if switch_to == "modified":
             epochs=300,
             pac=10,
             cuda=True,
+            disable_condvec=False,
             log_dict=None,
             evaluation_dict=None,
             generator_penalty_dict=None,
@@ -208,6 +210,7 @@ if switch_to == "modified":
             self._epochs = epochs
             self.pac = pac
 
+            self._disable_condvec = disable_condvec
             self._log_dict = log_dict
             self._evaluation_dict = evaluation_dict
             self._generator_penalty_dict = generator_penalty_dict
@@ -224,6 +227,7 @@ if switch_to == "modified":
             self._transformer = None
             self._data_sampler = None
             self._generator = None
+            
 
         @staticmethod
         def _gumbel_softmax(logits, tau=1, hard=False, eps=1e-10, dim=-1):
@@ -281,6 +285,33 @@ if switch_to == "modified":
 
             return torch.cat(data_t, dim=1)
 
+        def _validate_discrete_columns(self, train_data, discrete_columns):
+            """Check whether ``discrete_columns`` exists in ``train_data``.
+
+            Args:
+                train_data (numpy.ndarray or pandas.DataFrame):
+                    Training Data. It must be a 2-dimensional numpy array or a pandas.DataFrame.
+                discrete_columns (list-like):
+                    List of discrete columns to be used to generate the Conditional
+                    Vector. If ``train_data`` is a Numpy array, this list should
+                    contain the integer indices of the columns. Otherwise, if it is
+                    a ``pandas.DataFrame``, this list should contain the column names.
+            """
+            if isinstance(train_data, pd.DataFrame):
+                invalid_columns = set(discrete_columns) - set(train_data.columns)
+            elif isinstance(train_data, np.ndarray):
+                invalid_columns = []
+                for column in discrete_columns:
+                    if column < 0 or column >= train_data.shape[1]:
+                        invalid_columns.append(column)
+            else:
+                raise TypeError(
+                    "``train_data`` should be either pd.DataFrame or np.array."
+                )
+
+            if invalid_columns:
+                raise ValueError(f"Invalid columns found: {invalid_columns}")
+            
         def _cond_loss(self, data, c, m):
             """Compute the cross entropy loss on the fixed discrete column."""
             loss = []
@@ -335,10 +366,10 @@ if switch_to == "modified":
             return loss_info
 
         def _info_loss_tablegan(
-            self, moving_average_type, id, model_disc, data_real, data_fake
+            self, moving_average_type, id, data_real, data_fake
         ):
-            model_disc_copy = copy.deepcopy(model_disc)
-            model_disc_copy.seq = Sequential(*list(model_disc.seq.children())[:-1])
+            model_disc_copy = copy.deepcopy(self._discriminator)
+            model_disc_copy.seq = Sequential(*list(self._discriminator.seq.children())[:-1])
             real_features = model_disc_copy(data_real)
             fake_features = model_disc_copy(data_fake)
             if moving_average_type == "simple":
@@ -357,7 +388,10 @@ if switch_to == "modified":
                     fake_std_features,
                 ) = self._exponential_moving_average(id, real_features, fake_features)
             else:
-                raise NotImplementedError()
+                real_mean_features = real_features.mean(dim=0)  
+                fake_mean_features = fake_features.mean(dim=0)
+                real_std_features = real_features.std(dim=0)
+                fake_std_features = fake_features.std(dim=0)
 
             loss_mean = torch.norm(real_mean_features - fake_mean_features, p=2)
             loss_std = torch.norm(real_std_features - fake_std_features, p=2)
@@ -484,32 +518,37 @@ if switch_to == "modified":
                 fake_std_features,
             )
 
-        def _validate_discrete_columns(self, train_data, discrete_columns):
-            """Check whether ``discrete_columns`` exists in ``train_data``.
+        def _pca_loss(self, data_real, data_fake):
+            """PCA-embedded data loss implementation.
 
             Args:
-                train_data (numpy.ndarray or pandas.DataFrame):
-                    Training Data. It must be a 2-dimensional numpy array or a pandas.DataFrame.
-                discrete_columns (list-like):
-                    List of discrete columns to be used to generate the Conditional
-                    Vector. If ``train_data`` is a Numpy array, this list should
-                    contain the integer indices of the columns. Otherwise, if it is
-                    a ``pandas.DataFrame``, this list should contain the column names.
-            """
-            if isinstance(train_data, pd.DataFrame):
-                invalid_columns = set(discrete_columns) - set(train_data.columns)
-            elif isinstance(train_data, np.ndarray):
-                invalid_columns = []
-                for column in discrete_columns:
-                    if column < 0 or column >= train_data.shape[1]:
-                        invalid_columns.append(column)
-            else:
-                raise TypeError(
-                    "``train_data`` should be either pd.DataFrame or np.array."
-                )
+                data_real (torch.Tensor):
+                    Real data (b, m)
+                data_fake (torch.Tensor):
+                    Fake data with activation applied (b, m).
 
-            if invalid_columns:
-                raise ValueError(f"Invalid columns found: {invalid_columns}")
+            Returns:
+                loss_info:
+                    Summation of the norm of expected mean and
+                    standard deviation difference between the real
+                    and fake data.
+            """
+            
+            data_real = torch.from_numpy(self._pca.transform(data_real.detach().numpy()))
+            data_fake = torch.from_numpy(self._pca.transform(data_fake.detach().numpy()))
+            
+            data_real.requires_grad = True
+            data_fake.requires_grad = True
+            
+            loss_mean = torch.norm(
+                torch.mean(data_fake, dim=0) - torch.mean(data_real, dim=0), p=2
+            )
+            loss_std = torch.norm(
+                torch.std(data_fake, dim=0) - torch.std(data_real, dim=0), p=2
+            )
+            loss_info = loss_mean + loss_std
+
+            return loss_info
 
         @random_state
         def fit(self, train_data, discrete_columns=(), epochs=None):
@@ -552,18 +591,38 @@ if switch_to == "modified":
             )
 
             data_dim = self._transformer.output_dimensions
+            
+            if "pca_loss" in self._generator_penalty_dict["loss"]:
+                # fit pca model on the train_data
+                n_components = min(train_data.shape[0], train_data.shape[1])
+                n_components = min(n_components, 100)
+                self._pca = PCA(n_components=n_components)
+                self._pca.fit(train_data)
 
-            self._generator = Generator(
-                self._embedding_dim + self._data_sampler.dim_cond_vec(),
-                self._generator_dim,
-                data_dim,
-            ).to(self._device)
+            if self._disable_condvec:
+                self._generator = Generator(
+                    self._embedding_dim,
+                    self._generator_dim,
+                    data_dim,
+                ).to(self._device)
 
-            discriminator = Discriminator(
-                data_dim + self._data_sampler.dim_cond_vec(),
-                self._discriminator_dim,
-                pac=self.pac,
-            ).to(self._device)
+                self._discriminator = Discriminator(
+                    data_dim,
+                    self._discriminator_dim,
+                    pac=self.pac,
+                ).to(self._device)
+            else:
+                self._generator = Generator(
+                    self._embedding_dim + self._data_sampler.dim_cond_vec(),
+                    self._generator_dim,
+                    data_dim,
+                ).to(self._device)
+                
+                self._discriminator = Discriminator(
+                    data_dim + self._data_sampler.dim_cond_vec(),
+                    self._discriminator_dim,
+                    pac=self.pac,
+                ).to(self._device)
 
             optimizerG = optim.Adam(
                 self._generator.parameters(),
@@ -573,7 +632,7 @@ if switch_to == "modified":
             )
 
             optimizerD = optim.Adam(
-                discriminator.parameters(),
+                self._discriminator.parameters(),
                 lr=self._discriminator_lr,
                 betas=(0.5, 0.9),
                 weight_decay=self._discriminator_decay,
@@ -604,6 +663,7 @@ if switch_to == "modified":
                     "Loss/gen/cond",
                     "Loss/gen/sdgym_info",
                     "Loss/gen/tablegan_info",
+                    "Loss/gen/pca",
                 ]
             )
             ###
@@ -618,7 +678,13 @@ if switch_to == "modified":
                     for n in range(self._discriminator_steps):
                         fakez = torch.normal(mean=mean, std=std)
 
-                        condvec = self._data_sampler.sample_condvec(self._batch_size)
+                        if self._disable_condvec:
+                            condvec = None
+                        else:
+                            condvec = self._data_sampler.sample_condvec(
+                                self._batch_size
+                            )
+
                         if condvec is None:
                             c1, m1, col, opt = None, None, None, None
                             real = self._data_sampler.sample_data(
@@ -649,10 +715,10 @@ if switch_to == "modified":
                             real_cat = real
                             fake_cat = fakeact
 
-                        y_fake = discriminator(fake_cat)
-                        y_real = discriminator(real_cat)
+                        y_fake = self._discriminator(fake_cat)
+                        y_real = self._discriminator(real_cat)
 
-                        pen = discriminator.calc_gradient_penalty(
+                        pen = self._discriminator.calc_gradient_penalty(
                             real_cat, fake_cat, self._device, self.pac
                         )
                         loss_d = -(torch.mean(y_real) - torch.mean(y_fake))
@@ -663,7 +729,11 @@ if switch_to == "modified":
                         optimizerD.step()
 
                     fakez = torch.normal(mean=mean, std=std)
-                    condvec = self._data_sampler.sample_condvec(self._batch_size)
+
+                    if self._disable_condvec:
+                        condvec = None
+                    else:
+                        condvec = self._data_sampler.sample_condvec(self._batch_size)
 
                     if condvec is None:
                         c1, m1, col, opt = None, None, None, None
@@ -677,15 +747,16 @@ if switch_to == "modified":
                     fakeact = self._apply_activate(fake)
 
                     if c1 is not None:
-                        y_fake = discriminator(torch.cat([fakeact, c1], dim=1))
+                        y_fake = self._discriminator(torch.cat([fakeact, c1], dim=1))
                     else:
-                        y_fake = discriminator(fakeact)
+                        y_fake = self._discriminator(fakeact)
 
                     # Initialize the different types of losses defined
                     loss_g_adv = torch.Tensor([0])
                     loss_g_cond = torch.Tensor([0])
                     loss_g_sdgym_info = torch.Tensor([0])
                     loss_g_tablegan_info = torch.Tensor([0])
+                    loss_g_pca = torch.Tensor([0])
 
                     # Clear accumulated gradient
                     optimizerG.zero_grad()
@@ -735,11 +806,25 @@ if switch_to == "modified":
                                 loss_g_sdgym_info = self._info_loss_sdgym(
                                     data_real=real, data_fake=fakeact, norm=1
                                 )
+                            elif loss == "tablegan_info":
+                                loss_g_tablegan_info = self._info_loss_tablegan(
+                                    moving_average_type=None,
+                                    id=id_,
+                                    data_real=real_cat,
+                                    data_fake=fake_cat,
+                                )
+                            elif loss == "minimize_tablegan_info":
+                                loss_g_tablegan_info = self._info_loss_tablegan(
+                                    moving_average_type=None,
+                                    id=id_,
+                                    data_real=real_cat,
+                                    data_fake=fake_cat,
+                                )
+                                loss_g_tablegan_info = - loss_g_tablegan_info
                             elif loss == "exp_tablegan_info":
                                 loss_g_tablegan_info = self._info_loss_tablegan(
                                     moving_average_type="exponential",
                                     id=id_,
-                                    model_disc=discriminator,
                                     data_real=real_cat,
                                     data_fake=fake_cat,
                                 )
@@ -749,9 +834,12 @@ if switch_to == "modified":
                                 loss_g_tablegan_info = self._info_loss_tablegan(
                                     moving_average_type="simple",
                                     id=id_,
-                                    model_disc=discriminator,
                                     data_real=real_cat,
                                     data_fake=fake_cat,
+                                )
+                            elif loss == "pca_loss":
+                                loss_g_pca = self._pca_loss(
+                                    data_real=real, data_fake=fakeact
                                 )
                             else:
                                 raise NotImplementedError(
@@ -763,6 +851,7 @@ if switch_to == "modified":
                             + loss_g_cond
                             + loss_g_sdgym_info
                             + loss_g_tablegan_info
+                            + loss_g_pca
                         )
                         loss_g.backward()
                     else:
@@ -842,6 +931,7 @@ if switch_to == "modified":
                             loss_g_cond.item(),
                             loss_g_sdgym_info.item(),
                             loss_g_tablegan_info.item(),
+                            loss_g_pca.item(),
                         ]
                     )
                     logger.append(log)
@@ -857,6 +947,7 @@ if switch_to == "modified":
                             "Loss/gen/cond",
                             "Loss/gen/sdgym_info",
                             "Loss/gen/tablegan_info",
+                            "Loss/gen/pca",
                         ],
                         x=None,
                         xlabel="Epoch",
@@ -920,9 +1011,12 @@ if switch_to == "modified":
                 if global_condition_vec is not None:
                     condvec = global_condition_vec.copy()
                 else:
-                    condvec = self._data_sampler.sample_original_condvec(
-                        self._batch_size
-                    )
+                    if self._disable_condvec:
+                        condvec = None
+                    else:
+                        condvec = self._data_sampler.sample_original_condvec(
+                            self._batch_size
+                        )
 
                 if condvec is None:
                     pass
